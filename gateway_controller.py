@@ -1635,6 +1635,101 @@ def _detect_passkey_flow(windows):
     return None
 
 
+def _passkey_prompt_present(window_dump):
+    """Gateway can embed passkey 2FA in a generically titled dialog."""
+    return "use your passkey device" in " ".join((window_dump or "").casefold().split())
+
+
+def _handle_passkey_prompt(title):
+    """Return None if absent, or whether an Authenticate click was accepted.
+
+    Gateway 10.50's J is a JButton subclass. Use the original agent's
+    CLICK_IN_WIN/doClick path, never guessed coordinates. LIST exposes raw
+    accessible names, whereas WINDOW strips HTML and collapses whitespace.
+    A successful request only starts the ceremony; it is not login success.
+    """
+    dump = agent_window(title)
+    if not _passkey_prompt_present(dump):
+        return None
+    log.info("Passkey prompt detected in %r: Use your Passkey device", title)
+    if not _PASSKEY_AUTHENTICATE:
+        # Same reason string v0.8.1 emits for the browser-window variant,
+        # so monitors keyed on it keep matching. Without this gate the
+        # dialog would fall through to TOTP handling and the code would
+        # be typed into a field that isn't there.
+        log.error(
+            f"ALERT_2FA_FAILED mode={TRADING_MODE} "
+            f"reason=\"passkey/WebAuthn 2FA flow - unattended login not supported\" "
+            f"remediation=\"set PASSKEY_AUTHENTICATE=yes to have the "
+            f"controller press Authenticate, and run an authenticator "
+            f"alongside the container to complete the ceremony (README, "
+            f"Passkey section)\"")
+        return False
+    # WINDOW can dump multiple matches, but CLICK_IN_WIN uses the first.
+    if sum(line.startswith("=== window=") for line in dump.splitlines()) > 1:
+        log.error("Multiple windows match %r; refusing an ambiguous passkey click", title)
+        return False
+
+    labels = ("Authenticate >", "Authenticate", "Authenticate ›")
+    attempted = set()
+
+    def click(label):
+        attempted.add(label)
+        log.info("Passkey Authenticate candidate (raw): %r", label)
+        if not agent_click_in_window(title, label):
+            return False
+        # Returning True from here means handle_2fa reports success as
+        # soon as the click is accepted, before the ceremony completes.
+        # If the external authenticator never answers, the failure
+        # surfaces downstream as the API-port wait timing out rather than
+        # as a 2FA failure. That hand-off is deliberate: the controller
+        # has done the only part it can do.
+        log.info(
+            "Passkey Authenticate click accepted by agent; no further clicks "
+            "in this attempt. WebAuthn completion is outside this handler.")
+        # The dialog can remain open during the ceremony. Its status/button
+        # state is more useful than assuming the whole window must disappear.
+        time.sleep(0.5)
+        after = agent_window(title)
+        if after and after.startswith("OK"):
+            log.info("Passkey post-click dialog state:\n%s", after)
+        else:
+            log.warning("Passkey click accepted, but UI verification unavailable")
+        return True
+
+    for label in labels:
+        if click(label):
+            return True
+
+    # These names are global to this JVM, but activation stays scoped to the
+    # detected dialog. Preserve the raw spelling for exact agent matching.
+    _, names = agent_list("Authenticate")
+    candidates = []
+    for name in sorted(names):
+        if any(c in name for c in "\r\n"):
+            continue  # The agent protocol is line-oriented.
+        normalised = " ".join(re.sub(r"<[^>]+>", " ", name).split())
+        if normalised in labels:
+            log.info("Passkey LIST button name (raw): %r", name)
+            if name not in attempted:
+                candidates.append(name)
+    if candidates:
+        # Revalidate the body before using identifiers from the global LIST.
+        if not _passkey_prompt_present(agent_window(title)):
+            log.warning("Passkey prompt changed before raw-name retry; not clicking")
+            return False
+        for name in candidates:
+            if click(name):
+                return True
+
+    log.error(
+        'ALERT_2FA_FAILED mode=%s reason="passkey Authenticate lookup failed"',
+        TRADING_MODE)
+    log.error("Passkey matching accessible names (escaped): %r", sorted(names))
+    log.error("Passkey dialog state after failed lookup:\n%s", agent_window(title))
+    return False
+
+
 def _twofa_requested_method(labels, window_substr=None):
     """From ``agent_labels()`` output (a list of ``(window_title, text)``
     tuples) return Gateway's 2FA method-prompt label — IBKR phrases it as
@@ -1692,7 +1787,9 @@ def _twofa_method_mismatch(prompt, desired_device):
 def handle_2fa(app):
     """Handle Gateway's Second Factor Authentication dialog.
 
-    Supports two modes:
+    Passkey prompts are detected by their body text and Authenticate is
+    activated once via the agent; completing WebAuthn remains out of scope.
+    Otherwise supports these modes:
 
     1. **TOTP mode** (TWOFACTOR_CODE set): the controller generates a
        TOTP code and types it into the dialog's text field, then clicks
@@ -1808,6 +1905,20 @@ def handle_2fa(app):
             time.sleep(0.5)
             continue
 
+        # Look for the 2FA dialog
+        two_fa_window = None
+        for type_, title, modal in windows:
+            if TWOFA_WINDOW_SUBSTR in title:
+                two_fa_window = (type_, title, modal)
+                break
+
+        # Inspect the generic dialog before classifying it as TOTP/IB Key
+        # or rejecting a separately titled passkey/browser window.
+        if two_fa_window is not None:
+            passkey_result = _handle_passkey_prompt(two_fa_window[1])
+            if passkey_result is not None:
+                return passkey_result
+
         # Passkey / WebAuthn: IBKR moved some accounts (Hong Kong and
         # Japan as of 2026-08, possibly wider over time) off TOTP onto
         # passkeys. Gateway then launches an in-app browser (jxbrowser)
@@ -1840,13 +1951,6 @@ def handle_2fa(app):
                 "installer issue). See issue #22.")
             return False
 
-        # Look for the 2FA dialog
-        two_fa_window = None
-        for type_, title, modal in windows:
-            if TWOFA_WINDOW_SUBSTR in title:
-                two_fa_window = (type_, title, modal)
-                break
-
         if two_fa_window is not None:
             if ib_key_mode:
                 # IB Key push mode: the dialog appeared, IBKR sent a
@@ -1861,8 +1965,13 @@ def handle_2fa(app):
                         log.info("API port opened — IB Key approval succeeded")
                         return True
                     ws = agent_windows()
-                    still_there = any(TWOFA_WINDOW_SUBSTR in t
-                                      for _, t, _ in ws)
+                    current_title = next(
+                        (t for _, t, _ in ws if TWOFA_WINDOW_SUBSTR in t), None)
+                    still_there = current_title is not None
+                    if still_there:
+                        passkey_result = _handle_passkey_prompt(current_title)
+                        if passkey_result is not None:
+                            return passkey_result
                     if not still_there:
                         log.info("2FA dialog dismissed — IB Key approval "
                                  "detected, proceeding")
@@ -2088,6 +2197,11 @@ def handle_2fa(app):
                 windows = agent_windows()
                 for type_, title, modal in windows:
                     if TWOFA_WINDOW_SUBSTR in title:
+                        passkey_result = _handle_passkey_prompt(title)
+                        if passkey_result is not None:
+                            return passkey_result
+                        if not TOTP_SECRET:
+                            continue
                         code = generate_totp(TOTP_SECRET)
                         if agent_settext_in_window(TWOFA_WINDOW_SUBSTR, code):
                             time.sleep(0.5)
@@ -2891,6 +3005,18 @@ _CCP_MAINTENANCE_RECOVERY_DELAY_SECONDS = int(os.environ.get(
 # Every failure inside the adoption path falls through to the
 # controller-driven restart, so the worst case is the old behaviour
 # plus the adopt timeout.
+# PR #29 (jpike88): when Gateway's 2FA dialog shows the passkey prompt
+# ("Use your Passkey device …"), the controller can press Authenticate.
+# It never performs the WebAuthn ceremony itself — that must be completed
+# by an authenticator you run alongside the container (a virtual FIDO
+# device such as passless, a key passed through, or a person). Opt-in:
+# with it unset the controller keeps v0.8.1's behaviour and fails loudly
+# on a passkey prompt rather than pressing anything. Off by default
+# because the maintainer has no passkey account to verify it against;
+# it is validated by the contributor's live use and the flow tests.
+_PASSKEY_AUTHENTICATE = _coerce_yes_no(
+    os.environ.get("PASSKEY_AUTHENTICATE", "")) is True
+
 _AUTO_RESTART_ADOPT = _coerce_yes_no(
     os.environ.get("AUTO_RESTART_ADOPT", "yes")) is not False
 # How long to wait for the self-restarted JVM's agent to report a new
