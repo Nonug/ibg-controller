@@ -6,6 +6,9 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  # Manual run on any ref. Only tag refs publish: the release steps below
+  # are conditioned on refs/tags/v*, so a run on a branch builds and tests.
+  workflow_dispatch:
 
 permissions:
   contents: write
