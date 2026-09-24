@@ -21,23 +21,27 @@
 # minute, not a rebuild of the upstream image:
 #
 #   docker build -t ibg-controller:edge \
-#     --build-arg UPSTREAM_IMAGE=ghcr.io/gnzsnz/ib-gateway:latest \
-#     --build-arg IB_GATEWAY_VERSION=10.50.1e .
+#     --build-arg UPSTREAM_IMAGE=ghcr.io/gnzsnz/ib-gateway:<tag> \
+#     --build-arg IB_GATEWAY_VERSION=<tag> .
+#
+# Pass the same tag to both ARGs so the version label matches the base;
+# IB_GATEWAY_VERSION is a label only — nothing in the build reads it.
 #
 # CI builds against that line too, but only as a build-and-boot check —
-# the login, 2FA and dialog paths are verified against 10.45.x.
+# login/2FA/dialog behaviour was validated on the 10.45.x line, except the
+# passkey flow, which was validated end-to-end on the pinned 10.50.1e base.
 #
 # Build prerequisites: run `make` in the repo root first to populate
 # dist/ with the agent jar and the controller .py, then `docker build .`
 # from the same directory.
 
-ARG UPSTREAM_IMAGE=ghcr.io/gnzsnz/ib-gateway:10.45.1j@sha256:91165c0752ca534c0dad3c40683ae7c2745974d4d277651a90e90411ca609d8d
+ARG UPSTREAM_IMAGE=ghcr.io/gnzsnz/ib-gateway:10.50.1e@sha256:e340626b5569d476bb96f891b5435ec9b9da517afd1e03c71e73fc50188477b1
 FROM ${UPSTREAM_IMAGE}
 
 # Re-declare post-FROM so they're in scope for the LABEL below (a build ARG
 # declared before FROM is only visible to the FROM instruction itself).
 ARG UPSTREAM_IMAGE
-ARG IB_GATEWAY_VERSION=10.45.1j
+ARG IB_GATEWAY_VERSION=10.50.1e
 
 # Self-describing image: record the bundled IB Gateway version and the exact
 # upstream base so `docker inspect` (and the GHCR page) report them without
@@ -77,6 +81,13 @@ COPY docker/run.sh /home/ibgateway/scripts/run.sh
 # Used by the HEALTHCHECK directive below.
 COPY scripts/healthcheck.sh /home/ibgateway/scripts/healthcheck.sh
 
+# Root entrypoint + passless hidraw bridge. See scripts/entrypoint.sh:
+# the image starts as root so a hook can mknod the passless virtual
+# FIDO2 node (no udev in containers), then drops to uid 1000. Opt-in via
+# PASSKEY_HIDRAW_BRIDGE=yes; harmless when unused.
+COPY scripts/entrypoint.sh   /home/ibgateway/scripts/entrypoint.sh
+COPY scripts/hidraw-watch.sh /home/ibgateway/scripts/hidraw-watch.sh
+
 # Default port for the /health HTTP server the controller starts in
 # main(). docker/run.sh offsets the paper instance to base+1 when
 # DUAL_MODE=yes so both controllers can bind in the same container.
@@ -88,6 +99,8 @@ RUN chown -R 1000:1000 /home/ibgateway \
  && chmod 0755 /home/ibgateway/scripts/run.sh \
  && chmod 0755 /home/ibgateway/scripts/gateway_controller.py \
  && chmod 0755 /home/ibgateway/scripts/healthcheck.sh \
+ && chmod 0755 /home/ibgateway/scripts/entrypoint.sh \
+ && chmod 0755 /home/ibgateway/scripts/hidraw-watch.sh \
  && chmod 0644 /home/ibgateway/gateway-input-agent.jar
 
 # start-period gives the JVM + login pipeline time to finish before
@@ -97,6 +110,10 @@ RUN chown -R 1000:1000 /home/ibgateway \
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
     CMD /home/ibgateway/scripts/healthcheck.sh
 
-USER 1000:1000
+# Starts as root so entrypoint.sh can run the opt-in hidraw bridge, then
+# drops privileges to 1000:1000 before exec'ing run.sh. Upstream ran as
+# 1000 from the start; the drop now happens one step later.
+USER root
 WORKDIR /home/ibgateway
+ENTRYPOINT ["/home/ibgateway/scripts/entrypoint.sh"]
 CMD ["/home/ibgateway/scripts/run.sh"]

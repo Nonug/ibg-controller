@@ -146,20 +146,20 @@ jobs:
     # (JRE path, apt package rename, userid shift) before users do.
     #
     # The matrix covers the Gateway versions we verify against: two
-    # earlier pins (10.45.1c, 10.45.1g), the current stable pinned in
-    # release-image.yml (10.45.1j), and the head of upstream's `latest`
-    # channel (10.50.1e), which is a different Gateway minor. Add a new
-    # entry here when bumping verified versions in README.md /
+    # earlier pins (10.45.1c, 10.45.1g), the last behaviourally-validated
+    # line (10.45.1j), the current release pin (10.50.1e), and the head of
+    # upstream's `latest` channel, which is a different Gateway minor. Add
+    # a new entry here when bumping verified versions in README.md /
     # docs/FROM_IBC.md.
     #
     # Version tags, never the floating `:stable` / `:latest`, so a PR
     # run stays deterministic and upstream moving a channel can't turn
     # an unrelated PR red.
     #
-    # The `latest`-channel entry answers "does the image still build and
-    # boot on the newer Gateway line" (issue #24) — it is a build and
-    # smoke check only. Login, 2FA and the dialog handlers are verified
-    # against 10.45.x; nothing here claims they are verified on 10.50.
+    # The 10.50.1e entry answers "does the image still build and boot on
+    # the newer Gateway line" (issue #24) — it is a build and smoke
+    # check only. Login/2FA/dialog handlers were validated on 10.45.x,
+    # except the passkey flow, validated end-to-end on 10.50.1e.
     strategy:
       fail-fast: false
       matrix:

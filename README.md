@@ -83,7 +83,7 @@ Deeper guides:
 | Requirement | Notes |
 |---|---|
 | Linux `amd64`/`arm64` | Ubuntu 24.04 base tested |
-| IB Gateway 10.x | Release images pin **10.45.1j** (gnzsnz `:stable` line) |
+| IB Gateway 10.x | Release images pin **10.50.1e** (gnzsnz `:stable` line) |
 | Python 3.10+ | Runtime; stdlib only, no pip installs |
 | JDK 17+ | Build time only — runtime uses the JRE bundled with Gateway |
 | `python3`, `matchbox-window-manager`, `curl` | The only packages added on top of the upstream image |
@@ -96,7 +96,7 @@ Deeper guides:
 | TOTP 2FA (single method) | ✅ verified | ⚠️ code in place | |
 | IB Key push 2FA | ✅ wait mode | ✅ wait mode | waits for you to approve on the phone |
 | Multi-method 2FA | ⚠️ account-dependent | ⚠️ code in place | both dialog shapes detected and driven; the switch to TOTP is rejected on some accounts; see [2FA](#2fa) |
-| Passkey prompt (`PASSKEY_AUTHENTICATE=yes`) | ⚠️ contributor-validated | ⚠️ untested | presses Authenticate; your authenticator completes WebAuthn; amd64 plus extra libraries; see [2FA](#2fa) |
+| Passkey prompt (`PASSKEY_AUTHENTICATE=yes`) | ✅ verified | ⚠️ untested | presses Authenticate; your authenticator completes WebAuthn; amd64 only; see [2FA](#2fa) |
 | Existing-session dialog | ✅ verified | ⚠️ code in place | |
 | Post-login config (`READ_ONLY_API`, `TWS_MASTER_CLIENT_ID`, auto logoff/restart times) | ✅ verified | ⚠️ untested | |
 | Command server (`STOP`, `RESTART`, `RECONNECTACCOUNT`, `ENABLEAPI`) | ✅ verified | ⚠️ untested | `RECONNECTDATA` is TWS-only |
@@ -104,6 +104,9 @@ Deeper guides:
 ✅ verified = run end-to-end against a real IB account.
 ⚠️ code in place = written and unit-tested, not yet run against the
 real product.
+Behaviour was validated on the 10.45.x Gateway line, except the passkey
+flow, which was validated end-to-end on the pinned 10.50.1e base; other
+10.50.x paths are build- and boot-checked in CI only.
 
 ## 2FA
 
@@ -142,15 +145,19 @@ real product.
   and never emulates one; that is a different job than driving
   Gateway's dialogs. Unset, a passkey prompt fails loudly
   (`ALERT_2FA_FAILED reason="passkey/WebAuthn 2FA flow ..."`) as it has
-  since v0.8.1. Contributed and used in production by @jpike88; the
-  maintainer has no passkey account, so this is ⚠️ rather than ✅.
+  since v0.8.1. Contributed and used in production by @jpike88;
+  verified end-to-end on the pinned 10.50.1e base.
   Needs an amd64 base, because IBKR's arm64 installer ships no browser.
-  The prompt opens Gateway's embedded browser, whose system libraries
-  this image doesn't include: add the packages from
+  The prompt opens Gateway's embedded browser; the pinned base ships its
+  system libraries since
   [gnzsnz/ib-gateway-docker#440](https://github.com/gnzsnz/ib-gateway-docker/pull/440)
-  in an image of your own. See
+  (building on an older base, add those packages yourself). See
   [#22](https://github.com/code-hustler-ft3d/ibg-controller/issues/22)
   and [#29](https://github.com/code-hustler-ft3d/ibg-controller/pull/29).
+  For a fully headless setup with the
+  [passless](https://github.com/pando85/passless) software authenticator
+  (including the `PASSKEY_HIDRAW_BRIDGE` device plumbing), see
+  [`docs/PASSLESS.md`](docs/PASSLESS.md).
 - **Accounts with more than one method**: Gateway pre-picks one, and
   the dialog shape varies by account — some get a code dialog
   defaulted to one method, others a device-selector list. The
@@ -188,7 +195,8 @@ real product.
 | `TWS_PASSWORD_FILE`, `TWOFACTOR_CODE_FILE` | Docker-secrets variants: read the value from a file |
 | `TRADING_MODE` | `live`, `paper` (default), or `both` |
 | `TWOFA_DEVICE` | Multi-method accounts only: names the method `TWOFACTOR_CODE` satisfies (default `Mobile Authenticator app`). Matched against Gateway's device list without regard to case or spacing; if nothing matches, the log lists the entries it found. Ignored on single-method accounts. |
-| `PASSKEY_AUTHENTICATE` | `yes` makes the controller press **Authenticate** on Gateway's passkey prompt; an authenticator running alongside the container completes the WebAuthn ceremony. Unset, a passkey prompt fails loudly. Needs an amd64 base and extra browser libraries; see [2FA](#2fa). |
+| `PASSKEY_AUTHENTICATE` | `yes` makes the controller press **Authenticate** on Gateway's passkey prompt; an authenticator running alongside the container completes the WebAuthn ceremony. Unset, a passkey prompt fails loudly. Needs an amd64 base; see [2FA](#2fa). |
+| `PASSKEY_HIDRAW_BRIDGE` | `yes` runs the root hidraw bridge in the entrypoint so a virtual-FIDO2 authenticator (e.g. passless) as a sidecar can be reached by Gateway's embedded browser. Unset, the entrypoint still drops to uid 1000 and runs `run.sh`. See [`docs/PASSLESS.md`](docs/PASSLESS.md). |
 
 ### Connection
 

@@ -6,8 +6,50 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in passkey hidraw bridge for a software authenticator
+  (`PASSKEY_HIDRAW_BRIDGE=yes`).** Containers run no udev, so the
+  `/dev/hidrawN` node passless creates via `/dev/uhid` never appears
+  inside the Gateway container and JxBrowser can't reach it. The image
+  now starts as root, and `scripts/entrypoint.sh` optionally runs
+  `scripts/hidraw-watch.sh` to `mknod` the node from sysfs, probe it as
+  uid 1000, and drop to uid 1000 for `run.sh`. With the flag unset the
+  only change is that the privilege drop happens in the entrypoint
+  instead of the image's `USER` directive. The watcher emits
+  `ALERT_PASSKEY_DEVICE_BLOCKED` when the device cgroup blocks the node
+  (stale `HIDRAW_MAJOR` after a host reboot). See `docs/PASSLESS.md`.
+- **`docs/PASSLESS.md`** — end-to-end guide to the headless passkey
+  arrangement (host prerequisites, enrollment, compose wiring,
+  operations, security model).
+- **Automated upstream-base bumps.** `scripts/bump_upstream_base.py`
+  resolves the current gnzsnz `stable` digest and rewrites the Dockerfile
+  pin plus the README; `.github/workflows/bump-upstream-base.yml` runs it
+  weekly and opens a PR. The base stays digest-pinned — only the bump is
+  automated.
+
+### Changed
+
+- **Upstream Gateway base bumped 10.45.1j → 10.50.1e** (gnzsnz's current
+  `stable` line, still digest-pinned). 10.50.1e postdates
+  gnzsnz/ib-gateway-docker#440, so the image now ships the system
+  libraries Gateway's embedded browser needs — the passkey flow no longer
+  requires a derived image for that. The passkey flow was validated
+  end-to-end on 10.50.1e; other login/2FA/dialog paths were last validated
+  on the 10.45.x line and are build/boot-checked on 10.50.x.
+
 ### Fixed
 
+- **The passkey handler no longer fails loudly when IBKR's page starts
+  the WebAuthn ceremony itself.** Observed on a live account: the
+  embedded page auto-starts WebAuthn, disabling the in-JVM
+  `Authenticate` button and showing "Waiting for verification" before
+  the controller looks. The agent can't click a disabled button, so
+  every candidate returned `ERR not_found` and the controller emitted
+  `ALERT_2FA_FAILED reason="passkey Authenticate lookup failed"` even
+  though the ceremony was already under way. `_handle_passkey_prompt`
+  now recognises the in-progress state and reports it as handled; the
+  loud alert is reserved for a genuinely enabled-but-unclickable button.
 - **The README's `docker run` quick start now sets
   `USE_IBG_CONTROLLER=yes`.** Without it the image starts the IBC build
   from its base image instead of the controller. The flag is also listed

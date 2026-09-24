@@ -1,0 +1,107 @@
+name: Bump upstream base
+
+# Keeps the digest-pinned gnzsnz/ib-gateway base current without giving up
+# reproducibility: resolves `stable`'s current digest, rewrites the pin in
+# the Dockerfile (and README), validates the new base builds and the
+# controller imports, then opens a PR. See scripts/bump_upstream_base.py.
+#
+# The scheduled run uses only the default GITHUB_TOKEN. PRs it opens do
+# not trigger ci.yml (GitHub suppresses workflow runs caused by
+# GITHUB_TOKEN), so this workflow does the build/boot smoke itself.
+
+on:
+  schedule:
+    - cron: '23 6 * * 1'   # Mondays 06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install host tools used by the Makefile
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends make unzip
+
+      - name: make (populate dist/ for COPY)
+        run: make
+
+      - name: Resolve and rewrite the pin
+        id: bump
+        run: |
+          python3 scripts/bump_upstream_base.py --tag stable
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            version="$(sed -n 's/^ARG IB_GATEWAY_VERSION=//p' Dockerfile)"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and smoke-test the new base
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          TWS_USERID: x
+          TWS_PASSWORD: x
+          TRADING_MODE: paper
+        run: |
+          docker build -t ibg-controller:bump-check .
+          docker run --rm \
+            -e TWS_USERID -e TWS_PASSWORD -e TRADING_MODE \
+            --entrypoint python3 \
+            ibg-controller:bump-check \
+            -c 'import sys; sys.path.insert(0, "/home/ibgateway/scripts"); import gateway_controller as gc; print(f"OK upstream={gc.__version__} TRADING_MODE={gc.TRADING_MODE}")'
+
+      - name: Open pull request
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          PR_BODY: |
+            Automated bump of the digest-pinned `gnzsnz/ib-gateway` base to
+            the current `stable` line, from `scripts/bump_upstream_base.py`.
+
+            - The new base built and the controller imported cleanly in this run.
+            - PRs opened with the default `GITHUB_TOKEN` do not trigger `ci.yml`
+              (GitHub's recursion guard). Re-run CI manually, or push a commit,
+              to get the full build matrix.
+            - Login/2FA/dialog behaviour was last validated on 10.45.x; this
+              base is a different line, so treat it as build/boot-checked until
+              re-validated.
+
+            Refs: #24.
+        run: |
+          branch="chore/bump-ib-gateway-${VERSION}"
+          title="chore(base): bump IB Gateway to ${VERSION}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Dockerfile README.md
+          git commit -m "$title"
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            git push --force origin "$branch"
+          else
+            git push -u origin "$branch"
+          fi
+
+          if gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr edit "$branch" --title "$title" --body "$PR_BODY"
+          else
+            gh pr create --title "$title" --body "$PR_BODY" \
+              --base main --head "$branch"
+          fi

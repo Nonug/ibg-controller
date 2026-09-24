@@ -176,19 +176,21 @@ publish. Override `--build-arg UPSTREAM_IMAGE=...` only to build
 against a different Gateway; if you do, pass `IB_GATEWAY_VERSION` too
 so the image label reports what it actually contains.
 
-Any gnzsnz base works. To build against their `latest` channel instead
-of `stable` — a newer Gateway line, e.g. for the in-app browser the
-passkey flow uses:
+Any gnzsnz base works. To build against a different Gateway line, point
+`UPSTREAM_IMAGE` at the tag and derive `IB_GATEWAY_VERSION` from it so
+the image label matches what it actually contains:
 
 ```bash
+UPSTREAM=ghcr.io/gnzsnz/ib-gateway:latest
 docker build -t ibg-controller:edge \
-  --build-arg UPSTREAM_IMAGE=ghcr.io/gnzsnz/ib-gateway:latest \
-  --build-arg IB_GATEWAY_VERSION=10.50.1e .
+  --build-arg UPSTREAM_IMAGE="$UPSTREAM" \
+  --build-arg IB_GATEWAY_VERSION="${UPSTREAM##*:}" .
 ```
 
-CI covers that line as a build-and-boot check. The login, 2FA and
-dialog handlers are verified against 10.45.x only, so treat a
-`latest`-based image as unverified for those paths.
+CI covers the `latest` line as a build-and-boot check. Login/2FA/dialog
+handlers were validated on the 10.45.x line, except the passkey flow
+(validated end-to-end on the pinned 10.50.1e base); treat a base on another
+minor as build/boot-checked for those paths.
 
 ### 2. Convert your IBC config
 

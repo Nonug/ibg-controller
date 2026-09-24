@@ -1643,6 +1643,42 @@ def _passkey_prompt_present(window_dump):
     return "use your passkey device" in " ".join((window_dump or "").casefold().split())
 
 
+def _passkey_authenticate_disabled(window_dump):
+    """True when the passkey dialog's Authenticate button is disabled.
+
+    The agent's WINDOW dump marks a disabled component with a trailing
+    ``disabled`` token (see ``GatewayInputAgent.dumpComponentTree``), e.g.
+    ``J text="Authenticate >" disabled``. The agent's ``CLICK_IN_WIN``
+    deliberately skips disabled buttons, so on a dialog where IBKR's page
+    has already started the WebAuthn ceremony every candidate returns
+    ``ERR not_found`` — which is not a real lookup failure.
+    """
+    for line in (window_dump or "").splitlines():
+        low = line.casefold()
+        if "authenticate" not in low:
+            continue
+        if "text=" not in low and "accname=" not in low:
+            continue
+        return "disabled" in low
+    return False
+
+
+def _passkey_ceremony_in_progress(window_dump):
+    """True when Gateway's passkey dialog shows the WebAuthn ceremony
+    already under way: the Authenticate button is disabled, or the status
+    label reads "Waiting for verification".
+
+    IBKR's embedded page can start the ceremony itself before the
+    controller looks (observed racing on a live account, 2026-09). The
+    in-JVM button is then inert — there is nothing for the controller to
+    click — so this is success from its point of view, not a failure.
+    """
+    norm = " ".join((window_dump or "").casefold().split())
+    if "waiting for verification" in norm:
+        return True
+    return _passkey_authenticate_disabled(window_dump)
+
+
 def _handle_passkey_prompt(title):
     """Return None if absent, or whether an Authenticate click was accepted.
 
@@ -1668,6 +1704,17 @@ def _handle_passkey_prompt(title):
             f"alongside the container to complete the ceremony (README, "
             f"Passkey section)\"")
         return False
+    if _passkey_ceremony_in_progress(dump):
+        # IBKR's page auto-starts the WebAuthn ceremony; the dialog then
+        # shows Authenticate disabled and "Waiting for verification". The
+        # agent can't click a disabled button, so attempting it would only
+        # produce a misleading "lookup failed" alert. Let the authenticator
+        # finish — if it never does, the API-port wait downstream times out.
+        log.info(
+            "Passkey dialog already shows the WebAuthn ceremony in progress "
+            "(Authenticate disabled / 'Waiting for verification'); nothing to "
+            "click — letting the authenticator complete it.")
+        return True
     # WINDOW can dump multiple matches, but CLICK_IN_WIN uses the first.
     if sum(line.startswith("=== window=") for line in dump.splitlines()) > 1:
         log.error("Multiple windows match %r; refusing an ambiguous passkey click", title)
@@ -1724,6 +1771,16 @@ def _handle_passkey_prompt(title):
         for name in candidates:
             if click(name):
                 return True
+
+    # The page can start the ceremony while we were hunting for a button
+    # to click. If it did, the dialog now shows it in progress and there
+    # is nothing left for the controller to do — report success rather
+    # than the misleading "lookup failed" alert.
+    if _passkey_ceremony_in_progress(agent_window(title)):
+        log.info(
+            "Passkey Authenticate became disabled during lookup — the "
+            "ceremony is in progress; treating as handled.")
+        return True
 
     log.error(
         'ALERT_2FA_FAILED mode=%s reason="passkey Authenticate lookup failed"',

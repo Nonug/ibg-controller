@@ -698,6 +698,41 @@ log in attended via VNC. See issue #22.
 
 **Recommended debounce**: 15 min.
 
+### `ALERT_PASSKEY_DEVICE_BLOCKED`
+
+```
+ALERT_PASSKEY_DEVICE_BLOCKED major=243 minor=8 node=/dev/hidraw8 required_rule="c 243:* rwm" remediation="run deploy.sh to refresh HIDRAW_MAJOR in .env, then recreate the Gateway container"
+```
+
+**When fired**: by the opt-in passkey hidraw bridge
+(`PASSKEY_HIDRAW_BRIDGE=yes` → `scripts/hidraw-watch.sh`), **not** by the
+Python controller. The bridge is started as root by `entrypoint.sh` and
+`mknod`s the passless virtual FIDO2 `hidraw` node into the container
+(containers run no udev). Immediately after creating the node it probes
+whether the unprivileged `ibgateway` user (uid 1000) can open it; this
+alert fires when that probe is denied.
+
+**What it means**: the node exists but the container's device cgroup does
+not allow opening that `hidraw` major. Device cgroup rules are fixed when
+the container is created, and the hidraw *major* is assigned by the host
+kernel on every boot — so a host reboot or kernel update can leave the
+container holding a stale rule. `major=` in the alert is the *current*
+kernel major, i.e. the value the rule needs to allow. The token is
+emitted on stdout with the bridge's `.> hidraw-watch:` prefix, alongside
+the controller's own `ALERT_*` lines.
+
+**What the operator should do**: run `./deploy.sh` (recomputes the major
+into `.env`) and recreate the Gateway container (`docker compose up -d`).
+Until then Gateway's embedded browser cannot open the authenticator, so a
+passkey login stalls on "Use your Passkey device" and eventually times
+out.
+
+**Log level**: `INFO`. Non-fatal — the bridge keeps polling and re-emits
+after passless restarts (each restart allocates a new minor).
+
+**Recommended debounce**: none needed; the bridge emits once per created
+node and the remediation is identical each time.
+
 ## Docker `HEALTHCHECK`
 
 The shipped `Dockerfile` includes:
@@ -741,6 +776,10 @@ set `--no-healthcheck` at runtime or patch the Dockerfile.
 | `CCP_LOCKOUT_MAX_JVM_RESTARTS` | `0` | Number of SIGKILL-capable JVM teardown cycles `_escalate_to_jvm_restart` will attempt before giving up. Default `0` = halt immediately and emit `ALERT_CCP_PERSISTENT_HALT` (v0.5.9's new behaviour; rationale: the retry loop can compound the lockout it's trying to clear by re-stranding slots on each teardown). Set to `5` to restore pre-v0.5.9 auto-retry behaviour. Supersedes the internal `_JVM_RESTART_MAX_ATTEMPTS` constant when set positive. Added v0.5.9. |
 | `AUTO_RESTART_ADOPT` | `yes` | When the Gateway JVM exits right after install4j's restarter ran (Gateway's own `AUTO_RESTART_TIME` restart), adopt the instance install4j brings up instead of launching a second one — no login, no second factor. `no` restores the always-relaunch behaviour that raced the restarter (issue #23). Added v0.9.0. |
 | `PASSKEY_AUTHENTICATE` | unset (`no`) | `yes` lets the controller press **Authenticate** on Gateway's passkey prompt; the WebAuthn ceremony itself must be completed by an authenticator you run alongside the container. Unset, a passkey prompt fails loudly (`ALERT_2FA_FAILED reason="passkey/WebAuthn 2FA flow …"`) as it has since v0.8.1. Added v0.10.0. |
+| `PASSKEY_HIDRAW_BRIDGE` | unset (`no`) | `yes` starts `scripts/hidraw-watch.sh` as root in `entrypoint.sh`, which `mknod`s the passless virtual FIDO2 `hidraw` node into the container and probes it as uid 1000. Needed when a software authenticator (e.g. [passless](https://github.com/pando85/passless)) runs as a sidecar. Emits `ALERT_PASSKEY_DEVICE_BLOCKED` when the device cgroup blocks the node. Harmless unset: the entrypoint still drops to uid 1000 and runs `run.sh`. See `docs/PASSLESS.md`. |
+| `PASSKEY_HIDRAW_MATCH` | `Virtual FIDO2` | `uevent` substring the bridge matches to find the authenticator's hidraw device. Override if your authenticator advertises a different product string. |
+| `PASSKEY_HIDRAW_UID` / `PASSKEY_HIDRAW_GID` | `1000` / `1000` | Owner of the created node. Must match the uid/gid the Gateway runs as (the bridge's open probe uses the uid). |
+| `PASSKEY_HIDRAW_POLL` | `2` | Bridge poll interval, seconds. |
 | `AUTO_RESTART_PROBE_SECONDS` | `15` | When a clean JVM exit leaves no fresh `restarter.log`, how long to ask the agent socket whether a Gateway JVM the controller didn't spawn is already running (`ALERT_AUTO_RESTART detected_via=agent_socket`). Set to `0` to detect self-restarts only via `restarter.log`. This is the worst-case delay added to a genuine crash recovery on a clean exit, alongside the 5 s late-log grace. Added v0.9.0. |
 | `AUTO_RESTART_ADOPT_TIMEOUT_SECONDS` | `90` | How long to wait for the self-restarted JVM's agent to answer with a new PID before giving up on adoption and falling back to a relaunch (`ALERT_AUTO_RESTART status=failed_no_agent`). The issue #23 reporter observed 0-3 s on their host; the default leaves room for slower ones. Added v0.9.0. |
 

@@ -2231,7 +2231,31 @@ class TestTwofaSelectorPresent(unittest.TestCase):
         self.assertFalse(gc._twofa_selector_present(None))
 
 
-class TestHandle2faSelectorFlow(unittest.TestCase):
+class _TwofaEnvIsolated(unittest.TestCase):
+    """Base for tests that drive handle_2fa.
+
+    handle_2fa reads TWOFA_DEVICE and the timeout knobs straight from
+    os.environ, so a developer shell with a `.env` exported would
+    otherwise change the flow under test — e.g. TWOFA_DEVICE=Passkey
+    turns a TOTP dialog into a method mismatch. Pin them to the
+    defaults for each test.
+    """
+
+    _TWOFA_ENV_DEFAULTS = {
+        "TWOFA_DEVICE": "",
+        "TWOFA_EXIT_INTERVAL": "120",
+        "TWOFA_TIMEOUT_ACTION": "none",
+        "RELOGIN_AFTER_TWOFA_TIMEOUT": "",
+    }
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch.dict(os.environ, self._TWOFA_ENV_DEFAULTS, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class TestHandle2faSelectorFlow(_TwofaEnvIsolated):
     """Orchestration tests for handle_2fa's device-selector path
     (#20/#21), with every agent_* wrapper stubbed at the module
     boundary and time.sleep no-op'd. The scenarios mirror the
@@ -2352,7 +2376,7 @@ class TestDetectPasskeyFlow(unittest.TestCase):
         self.assertIsNone(gc._detect_passkey_flow([("x", None, False)]))
 
 
-class TestHandle2faPasskeyFlow(unittest.TestCase):
+class TestHandle2faPasskeyFlow(_TwofaEnvIsolated):
     PASSKEY_WINDOWS = [
         ("JFrame", "IBKR Gateway", False),
         ("aV", "Security Key Authentication", True),
@@ -2752,6 +2776,12 @@ class TestAdoptSelfRestartedGateway(unittest.TestCase):
             patch.object(gc, "agent_click", return_value=True),
             patch.object(gc, "_redrive_login", return_value=cfg["redrive"]),
             patch.object(gc, "signal_ready"),
+            # The login-dialog branch consults the v0.5.10 maintenance
+            # guard. Pin it off by default so this class is deterministic
+            # regardless of the wallclock (the real check would otherwise
+            # sleep 480s when a run lands in 23:45-00:15 ET).
+            patch.object(gc, "_is_ibkr_maintenance_window", return_value=False),
+            patch.object(gc, "_apply_maintenance_recovery_delay"),
         ]
         return stack
 
@@ -3155,6 +3185,20 @@ _PASSKEY_DIALOG = (
     "OK\n=== window='Second Factor Authentication' ===\n"
     "JTextArea: Use your Passkey device to complete authentication\n"
     "JButton: Authenticate >\nJButton: Cancel\nEND\n")
+# Real agent WINDOW dumps captured from a live passkey account (2026-09).
+# IBKR's page auto-starts the WebAuthn ceremony, disabling the in-JVM
+# Authenticate button and showing "Waiting for verification" before the
+# controller looks — so CLICK_IN_WIN can never match it.
+_PASSKEY_ENABLED_DIALOG = (
+    "OK\n=== window=Second Factor Authentication type=o modal=true ===\n"
+    "JLabel text=\"Use your Passkey device\"\n"
+    "J text=\"Authenticate >\"\n"
+    "JLabel text=\"Need Help?\"\nEND\n")
+_PASSKEY_IN_PROGRESS_DIALOG = (
+    "OK\n=== window=Second Factor Authentication type=o modal=true ===\n"
+    "JLabel text=\"Use your Passkey device\"\n"
+    "J text=\"Authenticate >\" disabled\n"
+    "JLabel text=\"Waiting for verification\"\nEND\n")
 _RFC_SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"   # RFC 6238 test vector, not a real seed
 
 
@@ -3177,7 +3221,7 @@ class TestPasskeyPromptPresent(unittest.TestCase):
         self.assertFalse(gc._passkey_prompt_present(None))
 
 
-class TestHandle2faWithPasskeyHandler(unittest.TestCase):
+class TestHandle2faWithPasskeyHandler(_TwofaEnvIsolated):
     """Drives the real handle_2fa with a mock agent. The point is not the
     passkey feature in isolation but that adding it leaves every existing
     2FA flow untouched: TOTP still types a code and never presses
@@ -3268,6 +3312,119 @@ class TestHandle2faWithPasskeyHandler(unittest.TestCase):
         self.assertEqual(c["typed"], [])
         self.assertEqual(c["auth_clicks"], [])
         self.assertGreaterEqual(c["consulted"], 1, "handler runs in the IB Key loop too")
+
+
+class TestPasskeyCeremonyInProgress(unittest.TestCase):
+    """Pure helpers that recognise a WebAuthn ceremony IBKR's embedded
+    page started itself (live race, 2026-09). A disabled Authenticate
+    button is not a lookup failure — it means the ceremony is running."""
+
+    def test_disabled_button_detected(self):
+        self.assertTrue(
+            gc._passkey_authenticate_disabled(_PASSKEY_IN_PROGRESS_DIALOG))
+
+    def test_enabled_button_not_disabled(self):
+        self.assertFalse(
+            gc._passkey_authenticate_disabled(_PASSKEY_ENABLED_DIALOG))
+
+    def test_disabled_button_means_in_progress(self):
+        self.assertTrue(
+            gc._passkey_ceremony_in_progress(_PASSKEY_IN_PROGRESS_DIALOG))
+
+    def test_waiting_label_alone_means_in_progress(self):
+        dump = ("OK\nJ text=\"Authenticate >\"\n"
+                "JLabel text=\"Waiting for verification\"\nEND\n")
+        self.assertTrue(gc._passkey_ceremony_in_progress(dump))
+
+    def test_enabled_dialog_not_in_progress(self):
+        self.assertFalse(
+            gc._passkey_ceremony_in_progress(_PASSKEY_ENABLED_DIALOG))
+
+    def test_empty_and_none_are_false(self):
+        for fn in (gc._passkey_ceremony_in_progress,
+                   gc._passkey_authenticate_disabled):
+            self.assertFalse(fn(""))
+            self.assertFalse(fn(None))
+
+
+class TestHandlePasskeyPrompt(unittest.TestCase):
+    """Drives _handle_passkey_prompt directly so the disabled-button
+    tolerance is pinned without a full login. The agent is mocked; the
+    real handler decides."""
+
+    def _drive(self, dumps, *, gate=True, clicks=None, list_names=None):
+        if isinstance(dumps, str):
+            dumps = [dumps]
+        dump_seq = iter(dumps)
+        clicked = []
+        click_result = clicks if clicks is not None else (lambda _l: True)
+
+        def fake_window(_title=""):
+            return next(dump_seq, dumps[-1])
+
+        with patch.object(gc, "_PASSKEY_AUTHENTICATE", gate), \
+             patch.object(gc, "agent_window", side_effect=fake_window), \
+             patch.object(gc, "agent_click_in_window",
+                          side_effect=lambda _t, l: clicked.append(l) or click_result(l)), \
+             patch.object(gc, "agent_list",
+                          return_value=(set(), list_names or set())), \
+             patch.object(gc, "time") as fake_time:
+            fake_time.sleep = lambda *_: None
+            with self.assertLogs(gc.log, level="INFO") as logs:
+                result = gc._handle_passkey_prompt("Second Factor Authentication")
+        return result, clicked, "\n".join(logs.output)
+
+    def test_absent_returns_none(self):
+        with patch.object(gc, "agent_window",
+                          return_value="OK\nJLabel text='nope'\nEND"):
+            self.assertIsNone(
+                gc._handle_passkey_prompt("Second Factor Authentication"))
+
+    def test_gate_off_fails_loud_and_never_clicks(self):
+        result, clicked, logs = self._drive(_PASSKEY_ENABLED_DIALOG, gate=False)
+        self.assertFalse(result)
+        self.assertEqual(clicked, [])
+        self.assertIn("ALERT_2FA_FAILED", logs)
+        self.assertIn("unattended login not supported", logs)
+
+    def test_ceremony_in_progress_is_handled_without_clicking(self):
+        result, clicked, logs = self._drive(_PASSKEY_IN_PROGRESS_DIALOG)
+        self.assertTrue(result)
+        self.assertEqual(clicked, [], "a disabled button must not be clicked")
+        self.assertIn("ceremony in progress", logs)
+        self.assertNotIn("lookup failed", logs)
+
+    def test_enabled_dialog_presses_first_candidate(self):
+        result, clicked, logs = self._drive(_PASSKEY_ENABLED_DIALOG)
+        self.assertTrue(result)
+        self.assertEqual(clicked[0], "Authenticate >")
+
+    def test_lookup_failure_alerts(self):
+        result, clicked, logs = self._drive(
+            _PASSKEY_ENABLED_DIALOG, clicks=lambda _l: False)
+        self.assertFalse(result)
+        self.assertIn('passkey Authenticate lookup failed', logs)
+
+    def test_disabled_during_lookup_is_handled(self):
+        # The page starts the ceremony between our first look and the
+        # failed click; the re-check must report success, not alert.
+        result, clicked, logs = self._drive(
+            [_PASSKEY_ENABLED_DIALOG, _PASSKEY_IN_PROGRESS_DIALOG],
+            clicks=lambda _l: False)
+        self.assertTrue(result)
+        self.assertIn("became disabled during lookup", logs)
+        self.assertNotIn("lookup failed", logs)
+
+    def test_multiple_matching_windows_refused(self):
+        multi = ("OK\n=== window=Second Factor Authentication ===\n"
+                 "JLabel text=\"Use your Passkey device\"\n"
+                 "J text=\"Authenticate >\"\nEND\n"
+                 "=== window=Second Factor Authentication ===\n"
+                 "J text=\"Authenticate >\"\nEND\n")
+        result, clicked, logs = self._drive(multi)
+        self.assertFalse(result)
+        self.assertEqual(clicked, [])
+        self.assertIn("Multiple windows match", logs)
 
 
 class TestPasskeyGateEnvParsing(unittest.TestCase):
